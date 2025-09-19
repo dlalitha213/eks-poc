@@ -1,0 +1,70 @@
+name: Build, Push to ECR and Deploy Infra + App
+
+on:
+  push:
+    branches: ["main"]
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::538814125100:role/github-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform (infra)
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init & Apply (infra)
+        working-directory: infra
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Terraform Output (pass to app)
+        working-directory: infra
+        id: infra_outputs
+        run: |
+          terraform output -json > infra_outputs.json
+          cat infra_outputs.json
+
+      - name: Login to ECR (after infra created ECR repo)
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin REPLACE_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build & push frontend image to ECR
+        id: build-image
+        run: |
+          IMAGE_URI=REPLACE_ACCOUNT_ID.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/frontend-app:latest
+          docker build -t $IMAGE_URI ./frontend
+          docker push $IMAGE_URI
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+      - name: Setup Terraform (app)
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Apply app (uses ECR image)
+        working-directory: app
+        env:
+          TF_VAR_frontend_image: ${{ env.IMAGE_URI }}
+          TF_VAR_cluster_endpoint: ${{ fromJSON(needs.infra_outputs.outputs.cluster_endpoint.value) }}
+        run: |
+          terraform init
+          terraform apply -auto-approve
